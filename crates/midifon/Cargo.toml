@@ -1,0 +1,13 @@
+[package]
+name = "midifon"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "midifon"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+midifon-core = { path = "../midifon-core" }
+wxdragon = "0.9"

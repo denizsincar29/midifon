@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/midifon-core", "crates/mfcli"]
+members = ["crates/midifon-core", "crates/mfcli", "crates/midifon"]
 
 [workspace.package]
 version = "0.1.0"
