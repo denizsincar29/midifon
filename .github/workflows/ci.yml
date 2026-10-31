@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test core and CLI
+        run: cargo test -p midifon-core -p mfcli --release
+
+  build:
+    name: build (${{ matrix.os }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      LIBCLANG_PATH: ${{ runner.os == 'Windows' && 'C:\Program Files\LLVM\bin' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux deps
+        if: runner.os == 'Linux'
+        run: >
+          sudo apt-get update && sudo apt-get install -y
+          libasound2-dev pkg-config cmake build-essential
+          libgtk-3-dev libclang-dev libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release (CLI and GUI)
+        run: cargo build --release -p mfcli -p midifon
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir dist
+          cp target/release/mfcli target/release/midifon dist/
+          tar -C dist -czf midifon-linux-x86_64.tar.gz mfcli midifon
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          mkdir dist
+          Copy-Item target/release/mfcli.exe, target/release/midifon.exe dist/
+          Compress-Archive -Path dist/* -DestinationPath midifon-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: midifon-${{ runner.os }}
+          path: |
+            midifon-linux-x86_64.tar.gz
+            midifon-windows-x86_64.zip
+          if-no-files-found: error
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            midifon-linux-x86_64.tar.gz
+            midifon-windows-x86_64.zip
