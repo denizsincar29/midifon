@@ -8,7 +8,7 @@
 use midifon_core::devices;
 use midifon_core::engine::{Engine, Notice, Notifier, Phase, Playback, StartOptions, Started};
 use midifon_core::settings::{fmt_secs, parse_secs, Settings};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -20,6 +20,9 @@ const ID_NEW: Id = ID_HIGHEST + 1;
 const ID_OPEN: Id = ID_HIGHEST + 2;
 const ID_SAVE: Id = ID_HIGHEST + 3;
 const ID_SAVEAS: Id = ID_HIGHEST + 4;
+const ID_CLOSE: Id = ID_HIGHEST + 5;
+const ID_NEXT_TAB: Id = ID_HIGHEST + 6;
+const ID_PREV_TAB: Id = ID_HIGHEST + 7;
 // Record and play
 const ID_REC: Id = ID_HIGHEST + 10;
 const ID_PLAY: Id = ID_HIGHEST + 11;
@@ -39,8 +42,8 @@ const ID_DEV_REFRESH: Id = ID_HIGHEST + 32;
 // Help
 const ID_KEYS: Id = ID_HIGHEST + 40;
 
-#[derive(Default)]
 struct Doc {
+    id: u64,
     /// Файл, который играем и сохраняем (временный дубль или открытый файл).
     file: Option<PathBuf>,
     /// Куда документ сохранён пользователем.
@@ -49,12 +52,35 @@ struct Doc {
     dirty: bool,
 }
 
+impl Doc {
+    fn new(id: u64) -> Doc {
+        Doc { id, file: None, saved_as: None, dirty: false }
+    }
+
+    fn name(&self) -> String {
+        match &self.saved_as {
+            Some(p) => p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| fname(p)),
+            None => "untitled".into(),
+        }
+    }
+
+    /// Имя с звёздочкой, если есть несохранённые изменения.
+    fn label(&self) -> String {
+        format!("{}{}", self.name(), if self.dirty { "*" } else { "" })
+    }
+}
+
 struct State {
     frame: Frame,
-    log: TextCtrl,
+    status: StatusBar,
+    notebook: Notebook,
     engine: RefCell<Engine>,
     notices: Arc<Mutex<VecDeque<Notice>>>,
-    doc: RefCell<Doc>,
+    /// Документы в порядке вкладок.
+    docs: RefCell<Vec<Doc>>,
+    next_id: Cell<u64>,
+    /// Вкладка, которой принадлежит идущая запись или воспроизведение.
+    owner: Cell<Option<u64>>,
     takes_dir: PathBuf,
     last_sig: RefCell<String>,
 }
@@ -65,20 +91,51 @@ fn fname(p: &Path) -> String {
     p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string())
 }
 
-fn log(s: &State, msg: &str) {
-    s.log.append_text(&format!("{msg}\n"));
+/// Единственная точка вывода сообщений: строка состояния.
+/// Сюда же подключится озвучивание через NVDA.
+fn say(s: &State, msg: &str) {
+    s.status.set_status_text(msg, 0);
 }
 
 fn describe(n: &Notice) -> String {
     match n {
         Notice::TakeStarted { .. } => "Note detected. Recording.".into(),
         Notice::PauseSplit { saved } => format!("Detected pause, saved {}. Waiting for the next notes.", fname(saved)),
-        Notice::PauseStopped { .. } => "Detected pause. Recording stopped. Space plays it, Control S saves it.".into(),
-        Notice::TimerElapsed { saved: Some(_) } => "Time limit reached. Recording stopped. Space plays it, Control S saves it.".into(),
+        Notice::PauseStopped { .. } => "Detected pause. Recording stopped.".into(),
+        Notice::TimerElapsed { saved: Some(_) } => "Time limit reached. Recording stopped.".into(),
         Notice::TimerElapsed { saved: None } => "Time limit reached. Recording stopped, nothing was recorded.".into(),
         Notice::PlaybackFinished => "Playback finished.".into(),
         Notice::Error(e) => format!("Error: {e}"),
     }
+}
+
+// ───────────── вкладки ─────────────
+
+fn cur(s: &State) -> usize {
+    let n = s.docs.borrow().len();
+    (s.notebook.selection().max(0) as usize).min(n.saturating_sub(1))
+}
+
+fn cur_id(s: &State) -> u64 {
+    s.docs.borrow()[cur(s)].id
+}
+
+fn idx_of(s: &State, id: u64) -> Option<usize> {
+    s.docs.borrow().iter().position(|d| d.id == id)
+}
+
+/// Новая пустая вкладка (рабочее поле пустое). Возвращает её индекс.
+fn add_tab(s: &State) -> usize {
+    let id = s.next_id.get();
+    s.next_id.set(id + 1);
+    let panel = Panel::builder(&s.notebook).build();
+    s.docs.borrow_mut().push(Doc::new(id));
+    s.notebook.add_page(&panel, "untitled", true, None);
+    s.docs.borrow().len() - 1
+}
+
+fn doc_is_empty(d: &Doc) -> bool {
+    d.file.is_none()
 }
 
 // ───────────── меню ─────────────
@@ -111,16 +168,18 @@ fn update_options_menu(s: &State) {
     item_label(s, ID_DEV_OUT, &format!("&Output device: {}...", st.output.as_deref().unwrap_or("none")));
 }
 
-/// Состояние меню и заголовка окна. Вызывается только при изменении состояния.
+/// Состояние меню, заголовка окна и подписей вкладок. Вызывается только при изменении состояния.
 fn update_state_ui(s: &State) {
-    let (status, pb) = {
+    let ci = cur(s);
+    let (status, pb_raw) = {
         let e = s.engine.borrow();
         (e.status(), e.playback())
     };
-    let (has_file, dirty, saved_as) = {
-        let d = s.doc.borrow();
-        (d.file.is_some(), d.dirty, d.saved_as.clone())
+    let (cid, labels) = {
+        let d = s.docs.borrow();
+        (d[ci].id, d.iter().map(|x| x.label()).collect::<Vec<_>>())
     };
+    let pb = if s.owner.get() == Some(cid) { pb_raw } else { Playback::Stopped };
     let rec_active = status.phase != Phase::Idle;
 
     item_label(s, ID_REC, if rec_active { "Stop &recording\tCtrl+R" } else { "&Record\tCtrl+R" });
@@ -134,31 +193,13 @@ fn update_state_ui(s: &State) {
         }
     };
     item_label(s, ID_PLAY, play_label);
-    let name = match (&saved_as, has_file) {
-        (Some(p), _) => fname(p),
-        (None, true) => "Untitled recording".to_string(),
-        _ => String::new(),
-    };
-    let state = match (status.phase, pb) {
-        (Phase::Recording, _) => "Recording",
-        (Phase::Armed, _) => "Armed, waiting for the first note",
-        (_, Playback::Playing) => "Playing",
-        (_, Playback::Paused) => "Paused",
-        _ => "",
-    };
-    let mut title = String::new();
-    if !name.is_empty() {
-        title.push_str(&name);
-        if dirty {
-            title.push('*');
+
+    for (i, l) in labels.iter().enumerate() {
+        if s.notebook.get_page_text(i).as_deref() != Some(l.as_str()) {
+            s.notebook.set_page_text(i, l);
         }
-        title.push_str(" - ");
     }
-    title.push_str("midifon");
-    if !state.is_empty() {
-        title.push_str(&format!(" [{state}]"));
-    }
-    s.frame.set_title(&title);
+    s.frame.set_title(&format!("{} - midifon", labels[ci]));
 }
 
 // ───────────── диалоги ─────────────
@@ -188,20 +229,23 @@ fn ask_choice(s: &State, title: &str, msg: &str, names: &[String], current: Opti
     None
 }
 
-/// Если есть несохранённая запись, спрашивает, что делать. true — можно продолжать.
-fn confirm_discard(s: &State) -> bool {
-    if !s.doc.borrow().dirty {
+/// Если во вкладке есть несохранённая запись, спрашивает, что делать. true — можно продолжать.
+fn confirm_save(s: &State, idx: usize) -> bool {
+    let (dirty, label) = {
+        let d = s.docs.borrow();
+        (d[idx].dirty, d[idx].label())
+    };
+    if !dirty {
         return true;
     }
-    let dlg = MessageDialog::builder(
-        &s.frame,
-        "The recording is not saved. Save it first?",
-        "midifon",
-    )
-    .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::Cancel | MessageDialogStyle::IconQuestion)
-    .build();
+    if s.notebook.selection() != idx as i32 {
+        s.notebook.set_selection(idx);
+    }
+    let dlg = MessageDialog::builder(&s.frame, &format!("{label} is not saved. Save it first?"), "midifon")
+        .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::Cancel | MessageDialogStyle::IconQuestion)
+        .build();
     match dlg.show_modal() {
-        ID_YES => save(s),
+        ID_YES => save(s, idx),
         ID_NO => true,
         _ => false,
     }
@@ -209,33 +253,40 @@ fn confirm_discard(s: &State) -> bool {
 
 // ───────────── документ ─────────────
 
-fn set_new_take(s: &State, file: PathBuf) {
-    let mut d = s.doc.borrow_mut();
-    d.file = Some(file);
-    d.saved_as = None;
-    d.dirty = true;
+fn set_new_take(s: &State, id: u64, file: PathBuf) {
+    if let Some(i) = idx_of(s, id) {
+        let mut d = s.docs.borrow_mut();
+        d[i].file = Some(file);
+        d[i].saved_as = None;
+        d[i].dirty = true;
+    }
 }
 
 fn do_new(s: &State) {
-    if s.engine.borrow().status().phase != Phase::Idle {
+    add_tab(s);
+    say(s, "New tab. Control R records.");
+    refresh_state(s, true);
+}
+
+fn do_close_tab(s: &State) {
+    let idx = cur(s);
+    let id = s.docs.borrow()[idx].id;
+    if s.owner.get() == Some(id) {
         stop_all(s);
     }
-    if !confirm_discard(s) {
+    if !confirm_save(s, idx) {
         return;
     }
-    s.engine.borrow_mut().stop();
-    *s.doc.borrow_mut() = Doc::default();
-    log(s, "New. Press Control R to record.");
+    s.notebook.remove_page(idx);
+    s.docs.borrow_mut().remove(idx);
+    if s.docs.borrow().is_empty() {
+        add_tab(s);
+    }
+    say(s, "Tab closed.");
     refresh_state(s, true);
 }
 
 fn do_open(s: &State) {
-    if s.engine.borrow().status().phase != Phase::Idle {
-        stop_all(s);
-    }
-    if !confirm_discard(s) {
-        return;
-    }
     let dir = s.engine.borrow().settings().dir.to_string_lossy().into_owned();
     let dlg = FileDialog::builder(&s.frame)
         .with_message("Open MIDI file")
@@ -247,47 +298,57 @@ fn do_open(s: &State) {
     }
     let Some(p) = dlg.get_path() else { return };
     let p = PathBuf::from(p);
-    s.engine.borrow_mut().stop();
-    *s.doc.borrow_mut() = Doc { file: Some(p.clone()), saved_as: Some(p.clone()), dirty: false };
-    log(s, &format!("Opened {}. Press Space to play.", fname(&p)));
+    // пустую вкладку используем, иначе открываем новую
+    let idx = if doc_is_empty(&s.docs.borrow()[cur(s)]) { cur(s) } else { add_tab(s) };
+    {
+        let mut d = s.docs.borrow_mut();
+        d[idx].file = Some(p.clone());
+        d[idx].saved_as = Some(p.clone());
+        d[idx].dirty = false;
+    }
+    s.notebook.set_selection(idx);
+    say(s, &format!("Opened {}. Space plays.", fname(&p)));
     refresh_state(s, true);
 }
 
-/// Save: true, если документ теперь сохранён.
-fn save(s: &State) -> bool {
+/// Save: true, если вкладка теперь сохранена.
+fn save(s: &State, idx: usize) -> bool {
     let (file, saved_as) = {
-        let d = s.doc.borrow();
-        (d.file.clone(), d.saved_as.clone())
+        let d = s.docs.borrow();
+        (d[idx].file.clone(), d[idx].saved_as.clone())
     };
     let Some(file) = file else {
-        log(s, "Nothing to save.");
+        say(s, "Nothing to save.");
         return false;
     };
     match saved_as {
         Some(target) => {
             if target != file {
                 if let Err(e) = std::fs::copy(&file, &target) {
-                    log(s, &format!("Error: cannot save {}: {e}", fname(&target)));
+                    say(s, &format!("Error: cannot save {}: {e}", fname(&target)));
                     return false;
                 }
             }
-            s.doc.borrow_mut().dirty = false;
-            log(s, &format!("Saved {}.", fname(&target)));
+            s.docs.borrow_mut()[idx].dirty = false;
+            say(s, &format!("Saved {}.", fname(&target)));
             refresh_state(s, true);
             true
         }
-        None => save_as(s),
+        None => save_as(s, idx),
     }
 }
 
-fn save_as(s: &State) -> bool {
-    let Some(file) = s.doc.borrow().file.clone() else {
-        log(s, "Nothing to save.");
+fn save_as(s: &State, idx: usize) -> bool {
+    let (file, default_name) = {
+        let d = s.docs.borrow();
+        (d[idx].file.clone(), d[idx].saved_as.as_deref().map(fname).unwrap_or_else(|| "recording.mid".into()))
+    };
+    let Some(file) = file else {
+        say(s, "Nothing to save.");
         return false;
     };
     let dir = s.engine.borrow().settings().dir;
     let _ = std::fs::create_dir_all(&dir);
-    let default_name = s.doc.borrow().saved_as.as_deref().map(fname).unwrap_or_else(|| "recording.mid".into());
     let dlg = FileDialog::builder(&s.frame)
         .with_message("Save MIDI file")
         .with_default_dir(&dir.to_string_lossy())
@@ -305,7 +366,7 @@ fn save_as(s: &State) -> bool {
     }
     if target != file {
         if let Err(e) = std::fs::copy(&file, &target) {
-            log(s, &format!("Error: cannot save {}: {e}", fname(&target)));
+            say(s, &format!("Error: cannot save {}: {e}", fname(&target)));
             return false;
         }
     }
@@ -314,11 +375,11 @@ fn save_as(s: &State) -> bool {
         let _ = s.engine.borrow().update(|st| st.dir = parent);
     }
     {
-        let mut d = s.doc.borrow_mut();
-        d.saved_as = Some(target.clone());
-        d.dirty = false;
+        let mut d = s.docs.borrow_mut();
+        d[idx].saved_as = Some(target.clone());
+        d[idx].dirty = false;
     }
-    log(s, &format!("Saved {}.", fname(&target)));
+    say(s, &format!("Saved {}.", fname(&target)));
     refresh_state(s, true);
     true
 }
@@ -330,18 +391,26 @@ fn start_recording(s: &State) {
         s.engine.borrow_mut().stop();
     }
     if !s.engine.borrow().input_connected() {
-        log(s, "No input device. Choose one in the Devices menu, Input device.");
+        say(s, "No input device. Choose one in the Devices menu, Input device.");
         return;
     }
-    if !confirm_discard(s) {
-        return;
+    // записываем в пустую вкладку, иначе в новую: ничего не затирается
+    if !doc_is_empty(&s.docs.borrow()[cur(s)]) {
+        add_tab(s);
     }
+    let id = cur_id(s);
     let opts = StartOptions { name: Some("take".into()), dir: Some(s.takes_dir.clone()), pause_stops: true };
     let res = s.engine.borrow().start_with(opts);
     match res {
-        Ok(Started::Armed) => log(s, "Armed. Waiting for the first note. Control R or Space stops."),
-        Ok(Started::Recording(_)) => log(s, "Recording. Control R or Space stops."),
-        Err(e) => log(s, &format!("Error: {e:#}")),
+        Ok(Started::Armed) => {
+            s.owner.set(Some(id));
+            say(s, "Armed. Waiting for the first note. Control R or Space stops.");
+        }
+        Ok(Started::Recording(_)) => {
+            s.owner.set(Some(id));
+            say(s, "Recording. Control R or Space stops.");
+        }
+        Err(e) => say(s, &format!("Error: {e:#}")),
     }
     refresh_state(s, true);
 }
@@ -349,14 +418,17 @@ fn start_recording(s: &State) {
 /// Останавливает запись и/или воспроизведение.
 fn stop_all(s: &State) {
     let o = s.engine.borrow_mut().stop();
+    let owner = s.owner.take();
     match (o.was_recording, o.saved) {
         (true, Some(p)) => {
-            set_new_take(s, p);
-            log(s, "Recording stopped. Space plays it, Control S saves it.");
+            if let Some(id) = owner {
+                set_new_take(s, id, p);
+            }
+            say(s, "Recording stopped. Space plays it, Control S saves it.");
         }
-        (true, None) => log(s, "Recording stopped. Nothing was recorded."),
-        (false, _) if o.was_playing => log(s, "Playback stopped."),
-        _ => log(s, "Nothing is running."),
+        (true, None) => say(s, "Recording stopped. Nothing was recorded."),
+        (false, _) if o.was_playing => say(s, "Playback stopped."),
+        _ => say(s, "Nothing is running."),
     }
     refresh_state(s, true);
 }
@@ -370,18 +442,26 @@ fn do_record(s: &State) {
 }
 
 fn play_from_start(s: &State) {
-    let Some(file) = s.doc.borrow().file.clone() else {
-        log(s, "Nothing to play. Record with Control R or open a file with Control O.");
+    let (file, id) = {
+        let d = s.docs.borrow();
+        let doc = &d[cur(s)];
+        (doc.file.clone(), doc.id)
+    };
+    let Some(file) = file else {
+        say(s, "Nothing to play. Record with Control R or open a file with Control O.");
         return;
     };
     if s.engine.borrow().settings().output.is_none() {
-        log(s, "No output device. Choose one in the Devices menu, Output device.");
+        say(s, "No output device. Choose one in the Devices menu, Output device.");
         return;
     }
     let res = s.engine.borrow_mut().play(&file);
     match res {
-        Ok(()) => log(s, "Playing from the beginning."),
-        Err(e) => log(s, &format!("Error: {e:#}")),
+        Ok(()) => {
+            s.owner.set(Some(id));
+            say(s, "Playing from the beginning.");
+        }
+        Err(e) => say(s, &format!("Error: {e:#}")),
     }
     refresh_state(s, true);
 }
@@ -392,13 +472,12 @@ fn do_play_pause(s: &State) {
         return;
     }
     let pb = s.engine.borrow().playback();
-    match pb {
-        Playback::Stopped => play_from_start(s),
-        _ => {
-            let now = s.engine.borrow().toggle_pause();
-            log(s, if now == Playback::Paused { "Paused." } else { "Resumed." });
-            refresh_state(s, true);
-        }
+    if pb != Playback::Stopped && s.owner.get() == Some(cur_id(s)) {
+        let now = s.engine.borrow().toggle_pause();
+        say(s, if now == Playback::Paused { "Paused." } else { "Resumed." });
+        refresh_state(s, true);
+    } else {
+        play_from_start(s);
     }
 }
 
@@ -413,7 +492,7 @@ fn do_play_begin(s: &State) {
 
 fn save_err(s: &State, r: anyhow::Result<()>) {
     if let Err(e) = r {
-        log(s, &format!("Error: cannot save settings: {e:#}"));
+        say(s, &format!("Error: cannot save settings: {e:#}"));
     }
 }
 
@@ -430,7 +509,7 @@ fn opt_toggle(s: &State, id: Id) {
         ID_OPT_PAUSE => ("Stop after pause", on),
         _ => ("Keep controllers", on),
     };
-    log(s, &format!("{what}: {}.", if state { "on" } else { "off" }));
+    say(s, &format!("{what}: {}.", if state { "on" } else { "off" }));
 }
 
 fn opt_pause_len(s: &State) {
@@ -443,9 +522,9 @@ fn opt_pause_len(s: &State) {
         Ok(sec) if sec > 0.0 => {
             let r = s.engine.borrow().update(|st| st.pause_secs = sec);
             save_err(s, r);
-            log(s, &format!("Pause length: {sec} s."));
+            say(s, &format!("Pause length: {sec} s."));
         }
-        _ => log(s, "Enter a number of seconds greater than 0."),
+        _ => say(s, "Enter a number of seconds greater than 0."),
     }
 }
 
@@ -465,14 +544,14 @@ fn opt_timer(s: &State) {
         Some(0) => {
             let r = s.engine.borrow().update(|st| st.timer_secs = None);
             save_err(s, r);
-            log(s, "Time limit: off.");
+            say(s, "Time limit: off.");
         }
         Some(t) => {
             let r = s.engine.borrow().update(|st| st.timer_secs = Some(t));
             save_err(s, r);
-            log(s, &format!("Time limit: {}.", fmt_secs(t)));
+            say(s, &format!("Time limit: {}.", fmt_secs(t)));
         }
-        None => log(s, "Could not read the time. Examples: 90, 2m, 1:30."),
+        None => say(s, "Could not read the time. Examples: 90, 2m, 1:30."),
     }
 }
 
@@ -490,9 +569,9 @@ fn opt_preroll(s: &State) {
         Ok(ms) if ms <= 5000 => {
             let r = s.engine.borrow().update(|st| st.preroll_ms = ms);
             save_err(s, r);
-            log(s, &format!("Pre-roll: {ms} ms."));
+            say(s, &format!("Pre-roll: {ms} ms."));
         }
-        _ => log(s, "Enter a number from 0 to 5000."),
+        _ => say(s, "Enter a number from 0 to 5000."),
     }
 }
 
@@ -509,20 +588,20 @@ fn refresh_devices(s: &State) {
     }
     if let Some(name) = &input {
         if !ins.contains(name) {
-            log(s, &format!("Saved input \"{name}\" is not available."));
+            say(s, &format!("Saved input \"{name}\" is not available."));
         } else if s.engine.borrow().status().phase == Phase::Idle {
             let already = st.input.as_deref() == Some(name.as_str()) && s.engine.borrow().input_connected();
             if !already {
                 match s.engine.borrow_mut().set_input(name) {
-                    Ok(()) => log(s, &format!("Input: {name}")),
-                    Err(e) => log(s, &format!("Error: {e:#}")),
+                    Ok(()) => say(s, &format!("Input: {name}")),
+                    Err(e) => say(s, &format!("Error: {e:#}")),
                 }
             }
         }
     }
     if st.output.is_none() && outs.len() == 1 {
         let _ = s.engine.borrow().set_output(&outs[0]);
-        log(s, &format!("Output: {}", outs[0]));
+        say(s, &format!("Output: {}", outs[0]));
     }
     update_options_menu(s);
 }
@@ -530,15 +609,15 @@ fn refresh_devices(s: &State) {
 fn pick_input(s: &State) {
     let names = devices::input_names().unwrap_or_default();
     if names.is_empty() {
-        log(s, "No MIDI input devices found.");
+        say(s, "No MIDI input devices found.");
         return;
     }
     let cur = s.engine.borrow().settings().input;
     if let Some(i) = ask_choice(s, "Input device", "Choose the MIDI input device:", &names, cur.as_deref()) {
         let res = s.engine.borrow_mut().set_input(&names[i]);
         match res {
-            Ok(()) => log(s, &format!("Input: {}", names[i])),
-            Err(e) => log(s, &format!("Error: {e:#}")),
+            Ok(()) => say(s, &format!("Input: {}", names[i])),
+            Err(e) => say(s, &format!("Error: {e:#}")),
         }
         update_options_menu(s);
     }
@@ -547,15 +626,15 @@ fn pick_input(s: &State) {
 fn pick_output(s: &State) {
     let names = devices::output_names().unwrap_or_default();
     if names.is_empty() {
-        log(s, "No MIDI output devices found.");
+        say(s, "No MIDI output devices found.");
         return;
     }
     let cur = s.engine.borrow().settings().output;
     if let Some(i) = ask_choice(s, "Output device", "Choose the MIDI output device:", &names, cur.as_deref()) {
         let res = s.engine.borrow().set_output(&names[i]);
         match res {
-            Ok(()) => log(s, &format!("Output: {}", names[i])),
-            Err(e) => log(s, &format!("Error: {e:#}")),
+            Ok(()) => say(s, &format!("Output: {}", names[i])),
+            Err(e) => say(s, &format!("Error: {e:#}")),
         }
         update_options_menu(s);
     }
@@ -566,7 +645,7 @@ fn pick_output(s: &State) {
 fn show_keys(s: &State) {
     let dlg = MessageDialog::builder(
         &s.frame,
-        "Control N: new\nControl O: open\nControl S: save\nControl Shift S: save as\n\nControl R: record or stop recording\nSpace: play, pause, resume; stops recording\nControl Space: play from the beginning\nEscape: stop\n\nF5: refresh devices",
+        "Control N: new tab\nControl Tab: next tab\nControl Shift Tab: previous tab\nControl W: close tab\nControl O: open\nControl S: save\nControl Shift S: save as\n\nControl R: record or stop recording\nSpace: play, pause, resume; stops recording\nControl Space: play from the beginning\nEscape: stop\n\nF5: refresh devices",
         "Keyboard shortcuts",
     )
     .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
@@ -588,16 +667,24 @@ fn refresh_state(s: &State, force: bool) {
     let pending: Vec<Notice> = s.notices.lock().unwrap().drain(..).collect();
     for n in &pending {
         match n {
-            Notice::PauseStopped { saved } | Notice::TimerElapsed { saved: Some(saved) } => set_new_take(s, saved.clone()),
+            Notice::PauseStopped { saved } | Notice::TimerElapsed { saved: Some(saved) } => {
+                if let Some(id) = s.owner.take() {
+                    set_new_take(s, id, saved.clone());
+                }
+            }
+            Notice::TimerElapsed { saved: None } => {
+                s.owner.set(None);
+            }
             _ => {}
         }
-        log(s, &describe(n));
+        say(s, &describe(n));
     }
 
     let sig = {
         let e = s.engine.borrow();
-        let d = s.doc.borrow();
-        format!("{:?}|{:?}|{}|{}|{:?}", e.status().phase, e.playback(), d.dirty, d.file.is_some(), d.saved_as)
+        let d = s.docs.borrow();
+        let docs: Vec<String> = d.iter().map(|x| format!("{}{}{}", x.label(), x.file.is_some(), x.id)).collect();
+        format!("{:?}|{:?}|{}|{}|{:?}", e.status().phase, e.playback(), cur(s), docs.join(","), s.owner.get())
     };
     if force || *s.last_sig.borrow() != sig || !pending.is_empty() {
         *s.last_sig.borrow_mut() = sig;
@@ -629,12 +716,15 @@ fn build() {
     let _ = std::fs::remove_dir_all(&takes_dir);
 
     let file = Menu::builder()
-        .append_item(ID_NEW, "&New\tCtrl+N", "Start a new empty recording")
+        .append_item(ID_NEW, "&New tab\tCtrl+N", "Open a new empty tab")
         .append_item(ID_OPEN, "&Open...\tCtrl+O", "Open a MIDI file")
         .append_item(ID_SAVE, "&Save\tCtrl+S", "Save the recording")
         .append_item(ID_SAVEAS, "Save &As...\tCtrl+Shift+S", "Save the recording under a new name")
+        .append_item(ID_CLOSE, "&Close tab\tCtrl+W", "Close the current tab")
+        .append_item(ID_NEXT_TAB, "Nex&t tab\tCtrl+Tab", "Switch to the next tab")
+        .append_item(ID_PREV_TAB, "&Previous tab\tCtrl+Shift+Tab", "Switch to the previous tab")
         .append_separator()
-        .append_item(ID_EXIT, "E&xit", "Quit")
+        .append_item(ID_EXIT, "E&xit\tAlt+F4", "Quit")
         .build();
     let rec = Menu::builder()
         .append_item(ID_REC, "&Record\tCtrl+R", "Start or stop recording")
@@ -667,33 +757,31 @@ fn build() {
         .append(help, "&Help")
         .build();
 
-    let frame = Frame::builder().with_title("midifon").with_size(Size::new(560, 360)).build();
+    let frame = Frame::builder().with_title("untitled - midifon").with_size(Size::new(560, 360)).build();
     frame.set_menu_bar(bar);
-    let panel = Panel::builder(&frame).build();
-    let log_label = StaticText::builder(&panel).with_label("Log:").build();
-    let log_box = TextCtrl::builder(&panel)
-        .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly)
-        .build();
-    let root = BoxSizer::builder(Orientation::Vertical).build();
-    root.add(&log_label, 0, SizerFlag::Left | SizerFlag::Top, 8);
-    root.add(&log_box, 1, SizerFlag::All | SizerFlag::Expand, 8);
-    panel.set_sizer(root, true);
+    let status = frame.create_status_bar(1, 0, ID_ANY as i32, "status");
+    // Рабочее поле: только вкладки, содержимое вкладок пустое
+    let notebook = Notebook::builder(&frame).build();
 
     let s: S = Rc::new(State {
         frame,
-        log: log_box,
+        status,
+        notebook,
         engine: RefCell::new(engine),
         notices,
-        doc: RefCell::new(Doc::default()),
+        docs: RefCell::new(Vec::new()),
+        next_id: Cell::new(1),
+        owner: Cell::new(None),
         takes_dir,
         last_sig: RefCell::new(String::new()),
     });
+    add_tab(&s);
 
     if let Some(e) = cfg_err {
-        log(&s, &format!("Config error: {e}. Using defaults."));
+        say(&s, &format!("Config error: {e}. Using defaults."));
     }
     refresh_devices(&s);
-    log(&s, "Ready. Control R records, Space plays, F10 or Alt opens the menu.");
+    say(&s, "Ready. Control R records, Space plays.");
     refresh_state(&s, true);
 
     let c = s.clone();
@@ -701,10 +789,17 @@ fn build() {
         ID_NEW => do_new(&c),
         ID_OPEN => do_open(&c),
         ID_SAVE => {
-            save(&c);
+            let i = cur(&c);
+            save(&c, i);
         }
         ID_SAVEAS => {
-            save_as(&c);
+            let i = cur(&c);
+            save_as(&c, i);
+        }
+        ID_CLOSE => do_close_tab(&c),
+        ID_NEXT_TAB | ID_PREV_TAB => {
+            c.notebook.advance_selection(ev.get_id() == ID_NEXT_TAB);
+            refresh_state(&c, true);
         }
         ID_REC => do_record(&c),
         ID_PLAY => do_play_pause(&c),
@@ -730,7 +825,7 @@ fn build() {
         ID_DEV_OUT => pick_output(&c),
         ID_DEV_REFRESH => {
             refresh_devices(&c);
-            log(&c, "Devices refreshed.");
+            say(&c, "Devices refreshed.");
         }
         ID_KEYS => show_keys(&c),
         ID_ABOUT => show_about(&c),
@@ -738,21 +833,30 @@ fn build() {
         _ => {}
     });
 
-    // закрытие: остановить запись и спросить про несохранённое; без skip окно не закроется
+    // смена вкладки: обновить заголовок и меню
+    let c = s.clone();
+    s.notebook.on_page_changed(move |_| refresh_state(&c, true));
+
+    // закрытие: остановить запись и спросить про несохранённое в каждой вкладке;
+    // без skip окно не закроется
     let c = s.clone();
     s.frame.on_close(move |ev| {
         if c.engine.borrow().status().phase != Phase::Idle {
             stop_all(&c);
         }
-        if confirm_discard(&c) {
-            c.engine.borrow_mut().stop();
-            ev.skip(true);
+        let n = c.docs.borrow().len();
+        for i in 0..n {
+            if !confirm_save(&c, i) {
+                return;
+            }
         }
+        c.engine.borrow_mut().stop();
+        ev.skip(true);
     });
 
-    // Space в журнале (на GTK поле забирает пробел раньше акселератора меню)
+    // Space на вкладках (на GTK элемент забирает пробел раньше акселератора меню)
     let c = s.clone();
-    s.log.on_key_down(move |ev| {
+    s.notebook.on_key_down(move |ev| {
         if let WindowEventData::Keyboard(k) = ev {
             if k.get_key_code() == Some(32) {
                 if k.control_down() {
@@ -776,5 +880,5 @@ fn build() {
 
     s.frame.centre();
     s.frame.show(true);
-    s.log.set_focus();
+    s.notebook.set_focus();
 }
