@@ -20,6 +20,8 @@ pub enum Notice {
     TakeStarted { path: PathBuf },
     /// Обнаружена пауза: файл сохранён, ждём следующие ноты.
     PauseSplit { saved: PathBuf },
+    /// Обнаружена пауза: файл сохранён, запись остановлена (режим pause_stops).
+    PauseStopped { saved: PathBuf },
     /// Сработал таймер: запись остановлена.
     TimerElapsed { saved: Option<PathBuf> },
     PlaybackFinished,
@@ -44,6 +46,24 @@ pub struct Status {
     pub last_saved: Option<PathBuf>,
 }
 
+/// Параметры одного запуска записи.
+#[derive(Debug, Clone, Default)]
+pub struct StartOptions {
+    /// Базовое имя файлов (иначе из настроек).
+    pub name: Option<String>,
+    /// Папка для файлов (иначе из настроек).
+    pub dir: Option<PathBuf>,
+    /// После паузы остановить запись, а не делить на файлы и ждать дальше.
+    pub pause_stops: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Playback {
+    Stopped,
+    Playing,
+    Paused,
+}
+
 #[derive(Debug, Clone)]
 pub enum Started {
     Armed,
@@ -59,7 +79,7 @@ pub struct StopOutcome {
 
 enum Msg {
     Midi { ts_us: u64, at: Instant, bytes: Vec<u8> },
-    Start { name: Option<String>, reply: Sender<Result<Started, String>> },
+    Start { opts: StartOptions, reply: Sender<Result<Started, String>> },
     Stop { reply: Sender<(bool, Option<PathBuf>)> },
     Shutdown,
 }
@@ -193,6 +213,7 @@ struct Session {
     next: u32,
     timer: Option<Duration>,
     deadline: Option<Instant>,
+    pause_stops: bool,
 }
 
 enum End {
@@ -218,8 +239,8 @@ impl Worker {
         loop {
             match rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(Msg::Midi { ts_us, at, bytes }) => self.on_midi(ts_us, at, &bytes),
-                Ok(Msg::Start { name, reply }) => {
-                    let _ = reply.send(self.start(name));
+                Ok(Msg::Start { opts, reply }) => {
+                    let _ = reply.send(self.start(opts));
                 }
                 Ok(Msg::Stop { reply }) => {
                     let was = self.phase != Phase::Idle;
@@ -248,11 +269,15 @@ impl Worker {
         self.publish();
     }
 
-    fn start(&mut self, name: Option<String>) -> Result<Started, String> {
+    fn start(&mut self, opts: StartOptions) -> Result<Started, String> {
+        let StartOptions { name, dir, pause_stops } = opts;
         if self.phase != Phase::Idle {
             return Err("already recording".into());
         }
-        let s = self.settings.lock().unwrap().clone();
+        let mut s = self.settings.lock().unwrap().clone();
+        if let Some(d) = dir {
+            s.dir = d;
+        }
         std::fs::create_dir_all(&s.dir)
             .map_err(|e| format!("cannot create folder {}: {e}", s.dir.display()))?;
         let name = name
@@ -265,6 +290,7 @@ impl Worker {
             next: 1,
             timer: s.timer_secs.map(Duration::from_secs),
             deadline: None,
+            pause_stops,
         });
         self.preroll.clear();
         if s.auto_start {
@@ -386,10 +412,15 @@ impl Worker {
             });
             if quiet {
                 if let Some(saved) = self.finish(End::LastNote) {
-                    self.phase = Phase::Armed;
-                    self.preroll.clear();
-                    self.publish();
-                    (self.notify)(Notice::PauseSplit { saved });
+                    if self.session.as_ref().map_or(false, |s| s.pause_stops) {
+                        self.reset_idle();
+                        (self.notify)(Notice::PauseStopped { saved });
+                    } else {
+                        self.phase = Phase::Armed;
+                        self.preroll.clear();
+                        self.publish();
+                        (self.notify)(Notice::PauseSplit { saved });
+                    }
                 }
             }
         }
@@ -529,8 +560,12 @@ impl Engine {
     }
 
     pub fn start(&self, name: Option<String>) -> Result<Started> {
+        self.start_with(StartOptions { name, ..Default::default() })
+    }
+
+    pub fn start_with(&self, opts: StartOptions) -> Result<Started> {
         let (reply, rx) = mpsc::channel();
-        self.tx.send(Msg::Start { name, reply }).map_err(|_| anyhow!("engine stopped"))?;
+        self.tx.send(Msg::Start { opts, reply }).map_err(|_| anyhow!("engine stopped"))?;
         rx.recv_timeout(Duration::from_secs(3))
             .map_err(|_| anyhow!("engine did not answer"))?
             .map_err(|e| anyhow!(e))
@@ -553,6 +588,29 @@ impl Engine {
 
     pub fn is_playing(&self) -> bool {
         self.player.as_ref().map_or(false, |p| !p.finished())
+    }
+
+    pub fn playback(&self) -> Playback {
+        match &self.player {
+            Some(p) if !p.finished() => {
+                if p.paused() {
+                    Playback::Paused
+                } else {
+                    Playback::Playing
+                }
+            }
+            _ => Playback::Stopped,
+        }
+    }
+
+    /// Пауза/продолжение воспроизведения. Возвращает новое состояние.
+    pub fn toggle_pause(&self) -> Playback {
+        if let Some(p) = &self.player {
+            if !p.finished() {
+                p.set_paused(!p.paused());
+            }
+        }
+        self.playback()
     }
 
     pub fn play(&mut self, path: &Path) -> Result<()> {

@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use midifon_core::devices;
 use midifon_core::engine::{Engine, Notice, Notifier, Phase, Started};
-use midifon_core::settings::Settings;
+use midifon_core::settings::{fmt_secs, parse_secs, Settings};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -90,6 +90,7 @@ fn describe(n: &Notice) -> String {
         }
         Notice::TimerElapsed { saved: Some(p) } => format!("Timer elapsed, saved {}. Recording stopped.", fname(p)),
         Notice::TimerElapsed { saved: None } => "Timer elapsed. Recording stopped, nothing was recorded.".into(),
+        Notice::PauseStopped { saved } => format!("Detected pause, saved {}. Recording stopped.", fname(saved)),
         Notice::PlaybackFinished => "Playback finished.".into(),
         Notice::Error(e) => format!("Error: {e}"),
     }
@@ -141,31 +142,6 @@ fn parse_onoff(arg: &str) -> Option<bool> {
         "on" | "1" | "yes" | "true" => Some(true),
         "off" | "0" | "no" | "false" => Some(false),
         _ => None,
-    }
-}
-
-/// "90", "90s", "2m", "1:30", "1h" → секунды
-fn parse_secs(arg: &str) -> Option<u64> {
-    let a = arg.trim().to_lowercase();
-    if let Some((m, s)) = a.split_once(':') {
-        return Some(m.parse::<u64>().ok()? * 60 + s.parse::<u64>().ok()?);
-    }
-    let (num, mul) = match a.chars().last()? {
-        's' => (&a[..a.len() - 1], 1),
-        'm' => (&a[..a.len() - 1], 60),
-        'h' => (&a[..a.len() - 1], 3600),
-        _ => (a.as_str(), 1),
-    };
-    Some(num.trim().parse::<u64>().ok()? * mul)
-}
-
-fn fmt_secs(s: u64) -> String {
-    if s >= 60 && s % 60 == 0 {
-        format!("{} min", s / 60)
-    } else if s >= 60 {
-        format!("{} min {} s", s / 60, s % 60)
-    } else {
-        format!("{s} s")
     }
 }
 

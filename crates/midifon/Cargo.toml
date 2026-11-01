@@ -2,6 +2,7 @@
 name = "midifon"
 version.workspace = true
 edition.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "midifon"
@@ -11,3 +12,6 @@ path = "src/main.rs"
 anyhow = "1"
 midifon-core = { path = "../midifon-core" }
 wxdragon = "0.9"
+
+[build-dependencies]
+embed-manifest = "1.4"

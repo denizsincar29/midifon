@@ -62,6 +62,7 @@ pub fn schedule(data: &[u8]) -> Result<Vec<(u64, Vec<u8>)>> {
 }
 
 pub struct Player {
+    paused: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -86,13 +87,14 @@ impl Player {
 
         let stop = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
-        let (stop2, done2) = (stop.clone(), done.clone());
+        let paused = Arc::new(AtomicBool::new(false));
+        let (stop2, done2, paused2) = (stop.clone(), done.clone(), paused.clone());
         let handle = std::thread::spawn(move || {
             let mut conn = conn;
-            let start = Instant::now() + Duration::from_millis(100);
+            let mut start = Instant::now() + Duration::from_millis(100);
             let mut natural = true;
             for (us, bytes) in &events {
-                if !wait_until(start + Duration::from_micros(*us), &stop2) {
+                if !wait_until(&mut start, *us, &stop2, &paused2, &mut conn) {
                     natural = false;
                     break;
                 }
@@ -104,7 +106,15 @@ impl Player {
                 notify(Notice::PlaybackFinished);
             }
         });
-        Ok(Player { stop, done, handle: Some(handle) })
+        Ok(Player { paused, stop, done, handle: Some(handle) })
+    }
+
+    pub fn paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    pub fn set_paused(&self, p: bool) {
+        self.paused.store(p, Ordering::SeqCst);
     }
 
     pub fn finished(&self) -> bool {
@@ -125,19 +135,36 @@ impl Drop for Player {
     }
 }
 
-/// Ждёт до момента `target`; false, если попросили остановиться.
-fn wait_until(target: Instant, stop: &AtomicBool) -> bool {
+/// Ждёт момента `start + us`; false, если попросили остановиться.
+/// На паузе глушит ноты и сдвигает `start` на время паузы.
+fn wait_until(
+    start: &mut Instant,
+    us: u64,
+    stop: &AtomicBool,
+    paused: &AtomicBool,
+    conn: &mut MidiOutputConnection,
+) -> bool {
     loop {
         if stop.load(Ordering::Relaxed) {
             return false;
         }
+        if paused.load(Ordering::Relaxed) {
+            let t0 = Instant::now();
+            silence(conn);
+            while paused.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            *start += t0.elapsed();
+            continue;
+        }
+        let target = *start + Duration::from_micros(us);
         let now = Instant::now();
         if now >= target {
             return true;
         }
         let left = target - now;
         if left > Duration::from_millis(2) {
-            std::thread::sleep((left - Duration::from_millis(1)).min(Duration::from_millis(20)));
+            std::thread::sleep((left - Duration::from_millis(1)).min(Duration::from_millis(10)));
         } else {
             std::hint::spin_loop();
         }

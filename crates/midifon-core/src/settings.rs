@@ -74,3 +74,28 @@ impl Settings {
             .with_context(|| format!("writing {}", path.display()))
     }
 }
+
+/// "90", "90s", "2m", "1:30", "1h" → секунды
+pub fn parse_secs(arg: &str) -> Option<u64> {
+    let a = arg.trim().to_lowercase();
+    if let Some((m, s)) = a.split_once(':') {
+        return Some(m.parse::<u64>().ok()? * 60 + s.parse::<u64>().ok()?);
+    }
+    let (num, mul) = match a.chars().last()? {
+        's' => (&a[..a.len() - 1], 1),
+        'm' => (&a[..a.len() - 1], 60),
+        'h' => (&a[..a.len() - 1], 3600),
+        _ => (a.as_str(), 1),
+    };
+    Some(num.trim().parse::<u64>().ok()? * mul)
+}
+
+pub fn fmt_secs(s: u64) -> String {
+    if s >= 60 && s % 60 == 0 {
+        format!("{} min", s / 60)
+    } else if s >= 60 {
+        format!("{} min {} s", s / 60, s % 60)
+    } else {
+        format!("{s} s")
+    }
+}

@@ -106,3 +106,28 @@ fn stop_closes_held_notes() {
     let sched = schedule(&std::fs::read(dir.join("held1.mid")).unwrap()).unwrap();
     assert_eq!(sched.iter().filter(|(_, b)| b[0] == 0x80).count(), 1);
 }
+
+#[test]
+fn pause_stops_recording_in_custom_dir() {
+    use midifon_core::engine::StartOptions;
+    let (mut e, log, dir, t0) = setup("pstop", |s| {
+        s.pause_split = true;
+        s.pause_secs = 0.3;
+        s.auto_start = true;
+    });
+    let custom = dir.join("sub");
+    e.start_with(StartOptions { name: Some("take".into()), dir: Some(custom.clone()), pause_stops: true }).unwrap();
+    send(&e, t0, &[0x90, 60, 90]);
+    ms(100);
+    send(&e, t0, &[0x80, 60, 0]);
+    ms(700);
+    // запись остановилась сама, в Armed не вернулась
+    assert_eq!(e.status().phase, Phase::Idle);
+    assert!(custom.join("take1.mid").exists());
+    let notes = log.lock().unwrap().clone();
+    assert!(notes.iter().any(|n| matches!(n, Notice::PauseStopped { saved } if saved.ends_with("take1.mid"))), "{notes:?}");
+    assert!(!notes.iter().any(|n| matches!(n, Notice::PauseSplit { .. })));
+    assert_eq!(e.status().last_saved.unwrap(), custom.join("take1.mid"));
+    let o = e.stop();
+    assert!(!o.was_recording);
+}
