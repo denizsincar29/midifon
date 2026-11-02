@@ -5,6 +5,8 @@
 //! Главный экран минимальный (только журнал), всё управление и все настройки живут в меню.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod speech;
+
 use midifon_core::devices;
 use midifon_core::engine::{Engine, Notice, Notifier, Phase, Playback, StartOptions, Started};
 use midifon_core::settings::{fmt_secs, parse_secs, Settings};
@@ -34,6 +36,7 @@ const ID_OPT_PAUSE: Id = ID_HIGHEST + 21;
 const ID_OPT_PAUSE_LEN: Id = ID_HIGHEST + 22;
 const ID_OPT_TIMER: Id = ID_HIGHEST + 23;
 const ID_OPT_KEEP: Id = ID_HIGHEST + 24;
+const ID_OPT_SPEECH: Id = ID_HIGHEST + 26;
 // Devices
 const ID_DEV_IN: Id = ID_HIGHEST + 30;
 const ID_DEV_OUT: Id = ID_HIGHEST + 31;
@@ -81,6 +84,7 @@ struct State {
     /// Вкладка, которой принадлежит идущая запись или воспроизведение.
     owner: Cell<Option<u64>>,
     takes_dir: PathBuf,
+    speech: speech::Speech,
     last_sig: RefCell<String>,
 }
 
@@ -91,9 +95,12 @@ fn fname(p: &Path) -> String {
 }
 
 /// Единственная точка вывода сообщений: строка состояния.
-/// Сюда же подключится озвучивание через NVDA.
+/// Дублируется речью через скринридер, если озвучка включена.
 fn say(s: &State, msg: &str) {
     s.status.set_status_text(msg, 0);
+    if s.engine.borrow().settings().speech {
+        s.speech.speak(msg);
+    }
 }
 
 fn describe(n: &Notice) -> String {
@@ -158,6 +165,7 @@ fn update_options_menu(s: &State) {
         bar.check_item(ID_OPT_AUTO, st.auto_start);
         bar.check_item(ID_OPT_PAUSE, st.pause_split);
         bar.check_item(ID_OPT_KEEP, st.keep_controllers);
+        bar.check_item(ID_OPT_SPEECH, st.speech);
     }
     item_label(s, ID_OPT_PAUSE_LEN, &format!("Pause &length: {} s...", st.pause_secs));
     let timer = st.timer_secs.map(fmt_secs).unwrap_or_else(|| "off".into());
@@ -534,12 +542,14 @@ fn opt_toggle(s: &State, id: Id) {
     let r = s.engine.borrow().update(|st| match id {
         ID_OPT_AUTO => st.auto_start = on,
         ID_OPT_PAUSE => st.pause_split = on,
+        ID_OPT_SPEECH => st.speech = on,
         _ => st.keep_controllers = on,
     });
     save_err(s, r);
     let (what, state) = match id {
         ID_OPT_AUTO => ("Start on first note", on),
         ID_OPT_PAUSE => ("Stop after pause", on),
+        ID_OPT_SPEECH => ("Spoken messages", on),
         _ => ("Keep controllers", on),
     };
     say(s, &format!("{what}: {}.", if state { "on" } else { "off" }));
@@ -754,6 +764,7 @@ fn build() {
         .append_item(ID_OPT_PAUSE_LEN, "Pause &length...", "Set the pause length")
         .append_item(ID_OPT_TIMER, "&Time limit...", "Set a recording time limit")
         .append_check_item(ID_OPT_KEEP, "&Keep controllers between recordings", "Write last controller values at the start of each recording")
+        .append_check_item(ID_OPT_SPEECH, "Spoken &messages", "Speak messages through the screen reader")
         .build();
     let dev = Menu::builder()
         .append_item(ID_DEV_IN, "&Input device...", "Choose the MIDI input")
@@ -788,6 +799,7 @@ fn build() {
         next_id: Cell::new(1),
         owner: Cell::new(None),
         takes_dir,
+        speech: speech::Speech::new(),
         last_sig: RefCell::new(String::new()),
     });
     add_tab(&s);
@@ -796,7 +808,10 @@ fn build() {
         say(&s, &format!("Config error: {e}. Using defaults."));
     }
     refresh_devices(&s);
-    say(&s, "Ready. Control R records, Space plays.");
+    match s.speech.backend_name() {
+        Some(n) => say(&s, &format!("Ready. Speech through {n}. Control R records, Space plays.")),
+        None => say(&s, "Ready. No screen reader output available. Control R records, Space plays."),
+    }
     refresh_state(&s, true);
 
     let c = s.clone();
@@ -820,7 +835,7 @@ fn build() {
         ID_PLAY => do_play_pause(&c),
         ID_PLAY_BEGIN => do_play_begin(&c),
         ID_STOP => stop_all(&c),
-        ID_OPT_AUTO | ID_OPT_PAUSE | ID_OPT_KEEP => {
+        ID_OPT_AUTO | ID_OPT_PAUSE | ID_OPT_KEEP | ID_OPT_SPEECH => {
             opt_toggle(&c, ev.get_id());
             refresh_state(&c, true);
         }

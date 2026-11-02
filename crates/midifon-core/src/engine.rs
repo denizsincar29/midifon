@@ -191,6 +191,19 @@ impl Take {
     }
 
     fn write(mut self, end_rel: u64) -> Result<(PathBuf, u32)> {
+        let mut end_rel = end_rel;
+        // первая нота = время 0: тишина перед ней не пишется, контроллеры до неё уходят на тик 0
+        let first_note = self
+            .events
+            .iter()
+            .find(|e| matches!(e.message, MidiMessage::NoteOn { vel, .. } if vel.as_int() > 0))
+            .map(|e| e.rel_us);
+        if let Some(f) = first_note {
+            for e in &mut self.events {
+                e.rel_us = e.rel_us.saturating_sub(f);
+            }
+            end_rel = end_rel.saturating_sub(f);
+        }
         // зависшие ноты закрываем в конце
         let end = end_rel.max(self.last_rel());
         let mut held: Vec<_> = self.held.iter().copied().collect();
@@ -423,7 +436,8 @@ impl Worker {
     /// Закрывает текущий файл. None — если писать нечего или произошла ошибка.
     fn finish(&mut self, end: End) -> Option<PathBuf> {
         let take = self.take.take()?;
-        if take.events.is_empty() {
+        // без единой ноты писать нечего (одни контроллеры файлом не считаем)
+        if take.events.is_empty() || take.last_note_at.is_none() {
             return None;
         }
         let end_rel = match end {

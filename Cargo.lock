@@ -884,6 +884,7 @@ dependencies = [
  "anyhow",
  "embed-manifest",
  "midifon-core",
+ "prismer",
  "wxdragon",
 ]
 
@@ -1109,6 +1110,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d83eb9bc6d8e5cf568e7a1101d60ee05e81ed50ea106026f3d18deeb046d7661"
 dependencies = [
  "zerovec",
+]
+
+[[package]]
+name = "prism-sys"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9056b582fac161198bd0ce7dd84424e5c287495ab3cbfb1dc106553bcd2ea4c9"
+dependencies = [
+ "cmake",
+]
+
+[[package]]
+name = "prismer"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fab1f6ae95403371691d7ea661c98a4811613cdc3cbb45a35b774386a6ffa78"
+dependencies = [
+ "prism-sys",
 ]
 
 [[package]]

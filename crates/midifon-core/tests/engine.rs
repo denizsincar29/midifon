@@ -90,8 +90,9 @@ fn manual_start_and_timer() {
     let notes = log.lock().unwrap().clone();
     assert!(notes.iter().any(|n| matches!(n, Notice::TimerElapsed { saved: Some(_) })), "{notes:?}");
     let sched = schedule(&std::fs::read(dir.join("jam1.mid")).unwrap()).unwrap();
-    // ведущая тишина сохранена (~200 мс до первой ноты)
-    assert!(sched[0].0 > 150_000, "lead {}", sched[0].0);
+    // тишина перед первой нотой не пишется: нота на времени 0
+    let first_on = sched.iter().find(|(_, b)| b[0] == 0x90).unwrap().0;
+    assert_eq!(first_on, 0, "{sched:?}");
     // второй rec не затирает первый
     e.start(None).unwrap();
     ms(50);

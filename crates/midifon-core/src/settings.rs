@@ -26,6 +26,8 @@ pub struct Settings {
     pub timer_secs: Option<u64>,
     /// Писать последние значения контроллеров в начало каждого нового файла.
     pub keep_controllers: bool,
+    /// Озвучивать сообщения через скринридер (NVDA и др.).
+    pub speech: bool,
     /// Темп в заголовке файла (на запись не влияет, только на шкалу тиков).
     pub bpm: f64,
 }
@@ -45,6 +47,7 @@ impl Default for Settings {
             pause_secs: 5.0,
             timer_secs: None,
             keep_controllers: true,
+            speech: true,
             bpm: 120.0,
         }
     }
