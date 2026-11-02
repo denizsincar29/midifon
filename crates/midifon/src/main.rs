@@ -34,7 +34,6 @@ const ID_OPT_PAUSE: Id = ID_HIGHEST + 21;
 const ID_OPT_PAUSE_LEN: Id = ID_HIGHEST + 22;
 const ID_OPT_TIMER: Id = ID_HIGHEST + 23;
 const ID_OPT_KEEP: Id = ID_HIGHEST + 24;
-const ID_OPT_PREROLL: Id = ID_HIGHEST + 25;
 // Devices
 const ID_DEV_IN: Id = ID_HIGHEST + 30;
 const ID_DEV_OUT: Id = ID_HIGHEST + 31;
@@ -163,7 +162,6 @@ fn update_options_menu(s: &State) {
     item_label(s, ID_OPT_PAUSE_LEN, &format!("Pause &length: {} s...", st.pause_secs));
     let timer = st.timer_secs.map(fmt_secs).unwrap_or_else(|| "off".into());
     item_label(s, ID_OPT_TIMER, &format!("&Time limit: {timer}..."));
-    item_label(s, ID_OPT_PREROLL, &format!("&Pre-roll: {} ms...", st.preroll_ms));
     item_label(s, ID_DEV_IN, &format!("&Input device: {}...", st.input.as_deref().unwrap_or("none")));
     item_label(s, ID_DEV_OUT, &format!("&Output device: {}...", st.output.as_deref().unwrap_or("none")));
 }
@@ -208,6 +206,41 @@ fn ask_text(s: &State, title: &str, msg: &str, default: &str) -> Option<String> 
     let dlg = TextEntryDialog::builder(&s.frame, msg, title).with_default_value(default).build();
     if dlg.show_modal() == ID_OK {
         dlg.get_value()
+    } else {
+        None
+    }
+}
+
+/// Диалог со счётчиком (spin): стрелки и цифры, а не текстовый ввод. None — отмена.
+fn ask_number(s: &State, title: &str, label: &str, value: f64, min: f64, max: f64, step: f64, digits: u32) -> Option<f64> {
+    let dlg = Dialog::builder(&s.frame, title).build();
+    let l = StaticText::builder(&dlg).with_label(label).build();
+    let spin = SpinCtrlDouble::builder(&dlg)
+        .with_range(min, max)
+        .with_style(SpinCtrlDoubleStyle::ProcessEnter)
+        .build();
+    spin.set_increment(step);
+    spin.set_digits(digits);
+    spin.set_value(value.clamp(min, max));
+    let ok = Button::builder(&dlg).with_label("OK").with_id(ID_OK).build();
+    let cancel = Button::builder(&dlg).with_label("Cancel").with_id(ID_CANCEL).build();
+    dlg.set_affirmative_id(ID_OK);
+    dlg.set_escape_id(ID_CANCEL);
+    // Enter в поле счётчика = OK
+    let d2 = dlg;
+    spin.on_enter(move |_| d2.end_modal(ID_OK));
+
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&ok, 0, SizerFlag::All, 6);
+    buttons.add(&cancel, 0, SizerFlag::All, 6);
+    let root = BoxSizer::builder(Orientation::Vertical).build();
+    root.add(&l, 0, SizerFlag::All, 10);
+    root.add(&spin, 0, SizerFlag::Left | SizerFlag::Right | SizerFlag::Expand, 10);
+    root.add_sizer(&buttons, 0, SizerFlag::All | SizerFlag::AlignRight, 6);
+    dlg.set_sizer_and_fit(root, true);
+    spin.set_focus();
+    if dlg.show_modal() == ID_OK {
+        Some(spin.get_value())
     } else {
         None
     }
@@ -514,18 +547,21 @@ fn opt_toggle(s: &State, id: Id) {
 
 fn opt_pause_len(s: &State) {
     let cur = s.engine.borrow().settings().pause_secs;
-    let Some(v) = ask_text(s, "Pause length", "Pause length in seconds (recording stops after this much silence):", &cur.to_string())
-    else {
+    let Some(sec) = ask_number(
+        s,
+        "Pause length",
+        "&Pause length, seconds (recording stops after this much silence):",
+        cur,
+        0.5,
+        600.0,
+        0.5,
+        1,
+    ) else {
         return;
     };
-    match v.trim().replace(',', ".").trim_end_matches('s').trim().parse::<f64>() {
-        Ok(sec) if sec > 0.0 => {
-            let r = s.engine.borrow().update(|st| st.pause_secs = sec);
-            save_err(s, r);
-            say(s, &format!("Pause length: {sec} s."));
-        }
-        _ => say(s, "Enter a number of seconds greater than 0."),
-    }
+    let r = s.engine.borrow().update(|st| st.pause_secs = sec);
+    save_err(s, r);
+    say(s, &format!("Pause length: {sec} s."));
 }
 
 fn opt_timer(s: &State) {
@@ -552,26 +588,6 @@ fn opt_timer(s: &State) {
             say(s, &format!("Time limit: {}.", fmt_secs(t)));
         }
         None => say(s, "Could not read the time. Examples: 90, 2m, 1:30."),
-    }
-}
-
-fn opt_preroll(s: &State) {
-    let cur = s.engine.borrow().settings().preroll_ms;
-    let Some(v) = ask_text(
-        s,
-        "Pre-roll",
-        "Pre-roll in milliseconds: how much controller activity before the first note is kept:",
-        &cur.to_string(),
-    ) else {
-        return;
-    };
-    match v.trim().parse::<u64>() {
-        Ok(ms) if ms <= 5000 => {
-            let r = s.engine.borrow().update(|st| st.preroll_ms = ms);
-            save_err(s, r);
-            say(s, &format!("Pre-roll: {ms} ms."));
-        }
-        _ => say(s, "Enter a number from 0 to 5000."),
     }
 }
 
@@ -738,7 +754,6 @@ fn build() {
         .append_item(ID_OPT_PAUSE_LEN, "Pause &length...", "Set the pause length")
         .append_item(ID_OPT_TIMER, "&Time limit...", "Set a recording time limit")
         .append_check_item(ID_OPT_KEEP, "&Keep controllers between recordings", "Write last controller values at the start of each recording")
-        .append_item(ID_OPT_PREROLL, "&Pre-roll...", "Set the pre-roll")
         .build();
     let dev = Menu::builder()
         .append_item(ID_DEV_IN, "&Input device...", "Choose the MIDI input")
@@ -815,10 +830,6 @@ fn build() {
         }
         ID_OPT_TIMER => {
             opt_timer(&c);
-            update_options_menu(&c);
-        }
-        ID_OPT_PREROLL => {
-            opt_preroll(&c);
             update_options_menu(&c);
         }
         ID_DEV_IN => pick_input(&c),

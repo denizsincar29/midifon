@@ -6,7 +6,7 @@ use midir::{Ignore, MidiInput, MidiInputConnection};
 use midly::live::LiveEvent;
 use midly::num::{u4, u7};
 use midly::{MidiMessage, PitchBend};
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -229,7 +229,8 @@ struct Worker {
     status: Arc<Mutex<Status>>,
     phase: Phase,
     ctrl: Controllers,
-    preroll: VecDeque<(u64, Instant, u4, MidiMessage)>,
+    /// Контроллеры, менявшиеся с момента `rec`, пока ждём первую ноту.
+    armed_ctrl: Controllers,
     take: Option<Take>,
     session: Option<Session>,
 }
@@ -265,7 +266,7 @@ impl Worker {
         self.phase = Phase::Idle;
         self.take = None;
         self.session = None;
-        self.preroll.clear();
+        self.armed_ctrl = Controllers::new();
         self.publish();
     }
 
@@ -292,18 +293,20 @@ impl Worker {
             deadline: None,
             pause_stops,
         });
-        self.preroll.clear();
+        self.armed_ctrl = Controllers::new();
         if s.auto_start {
             self.phase = Phase::Armed;
             self.publish();
             Ok(Started::Armed)
         } else {
-            let path = self.begin_take(Instant::now());
+            let path = self.begin_take(Instant::now(), false);
             Ok(Started::Recording(path))
         }
     }
 
-    fn begin_take(&mut self, start: Instant) -> PathBuf {
+    /// `armed`: запись ждала первую ноту. Контроллеры, менявшиеся за это время, всегда
+    /// попадают на тик 0; при `keep_controllers` туда же попадает всё прежнее состояние.
+    fn begin_take(&mut self, start: Instant, armed: bool) -> PathBuf {
         let (keep, bpm) = {
             let s = self.settings.lock().unwrap();
             (s.keep_controllers, s.bpm)
@@ -321,7 +324,13 @@ impl Worker {
         if let (Some(t), None) = (session.timer, session.deadline) {
             session.deadline = Some(start + t);
         }
-        let init = if keep { self.ctrl.snapshot() } else { Vec::new() };
+        let init = if keep {
+            self.ctrl.snapshot()
+        } else if armed {
+            self.armed_ctrl.snapshot()
+        } else {
+            Vec::new()
+        };
         self.take = Some(Take {
             path: path.clone(),
             n,
@@ -349,29 +358,14 @@ impl Worker {
             Phase::Armed => {
                 let is_note_on = matches!(message, MidiMessage::NoteOn { vel, .. } if vel.as_int() > 0);
                 if is_note_on {
-                    let start = self.preroll.front().map(|e| e.1).unwrap_or(at);
-                    let path = self.begin_take(start);
-                    let pre: Vec<_> = self.preroll.drain(..).collect();
+                    // первая нота = время 0
+                    let path = self.begin_take(at, true);
                     if let Some(take) = self.take.as_mut() {
-                        for (t, a, c, m) in pre {
-                            take.push(t, a, c, m);
-                        }
                         take.push(ts, at, channel, message);
                     }
                     (self.notify)(Notice::TakeStarted { path });
-                } else if matches!(
-                    message,
-                    MidiMessage::Controller { .. } | MidiMessage::PitchBend { .. } | MidiMessage::ProgramChange { .. }
-                ) {
-                    let window = Duration::from_millis(self.settings.lock().unwrap().preroll_ms);
-                    self.preroll.push_back((ts, at, channel, message));
-                    while let Some(front) = self.preroll.front() {
-                        if at.saturating_duration_since(front.1) > window {
-                            self.preroll.pop_front();
-                        } else {
-                            break;
-                        }
-                    }
+                } else {
+                    self.armed_ctrl.update(channel, &message);
                 }
             }
             Phase::Recording => {
@@ -417,7 +411,7 @@ impl Worker {
                         (self.notify)(Notice::PauseStopped { saved });
                     } else {
                         self.phase = Phase::Armed;
-                        self.preroll.clear();
+                        self.armed_ctrl = Controllers::new();
                         self.publish();
                         (self.notify)(Notice::PauseSplit { saved });
                     }
@@ -483,7 +477,7 @@ impl Engine {
             status: status.clone(),
             phase: Phase::Idle,
             ctrl: Controllers::new(),
-            preroll: VecDeque::new(),
+            armed_ctrl: Controllers::new(),
             take: None,
             session: None,
         };

@@ -59,6 +59,11 @@ fn pause_split_keeps_controllers() {
         // volume и program восстановлены в начале (время 0)
         assert!(sched.iter().any(|(t, b)| *t == 0 && b == &vec![0xB0, 7, 100]), "{f}: {sched:?}");
         assert!(sched.iter().any(|(t, b)| *t == 0 && b == &vec![0xC0, 5]), "{f}");
+        // педаль нажата до первой ноты: тоже на тике 0
+        assert!(sched.iter().any(|(t, b)| *t == 0 && b == &vec![0xB0, 64, 127]), "{f}: {sched:?}");
+        // первая нота = время 0, а не после паузы ожидания
+        let first_on = sched.iter().find(|(_, b)| b[0] == 0x90).unwrap().0;
+        assert_eq!(first_on, 0, "{f}");
     }
     // первый файл заканчивается на последней ноте (≈100 мс после первой), а не на паузе
     let s1 = schedule(&std::fs::read(dir.join("rec1.mid")).unwrap()).unwrap();
@@ -130,4 +135,31 @@ fn pause_stops_recording_in_custom_dir() {
     assert_eq!(e.status().last_saved.unwrap(), custom.join("take1.mid"));
     let o = e.stop();
     assert!(!o.was_recording);
+}
+
+#[test]
+fn keep_off_still_writes_controllers_changed_while_armed() {
+    let (mut e, _log, dir, t0) = setup("keepoff", |s| {
+        s.auto_start = true;
+        s.keep_controllers = false;
+    });
+    send(&e, t0, &[0xB0, 7, 100]); // до rec: не должно попасть
+    ms(30);
+    e.start(Some("k".into())).unwrap();
+    send(&e, t0, &[0xB0, 10, 20]); // pan после rec, до ноты: должно попасть на тик 0
+    send(&e, t0, &[0xB0, 10, 30]); // последнее значение побеждает
+    ms(50);
+    send(&e, t0, &[0x90, 60, 90]);
+    ms(80);
+    send(&e, t0, &[0x80, 60, 0]);
+    ms(30);
+    e.stop();
+    let sched = schedule(&std::fs::read(dir.join("k1.mid")).unwrap()).unwrap();
+    assert!(sched.iter().any(|(t, b)| *t == 0 && b == &vec![0xB0, 10, 30]), "{sched:?}");
+    assert!(!sched.iter().any(|(_, b)| b == &vec![0xB0, 10, 20]), "{sched:?}");
+    assert!(!sched.iter().any(|(_, b)| b == &vec![0xB0, 7, 100]), "{sched:?}");
+    // сначала контроллер, потом нота, оба на тике 0, в таком порядке
+    assert_eq!(sched[0].1, vec![0xB0, 10, 30]);
+    assert_eq!(sched[1].1, vec![0x90, 60, 90]);
+    assert_eq!(sched[1].0, 0);
 }

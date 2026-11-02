@@ -272,13 +272,6 @@ fn handle(engine: &mut Engine, line: &str) -> Result<bool> {
                 println!("Usage: timer <time> | off. Time: 90, 90s, 2m, 1:30.");
             }
         }
-        "preroll" => match arg.parse::<u64>() {
-            Ok(ms) => {
-                engine.update(|s| s.preroll_ms = ms)?;
-                println!("Pre-roll: {ms} ms.");
-            }
-            Err(_) => println!("Pre-roll is {} ms. Usage: preroll <milliseconds>", engine.settings().preroll_ms),
-        },
         "bpm" => match arg.parse::<f64>() {
             Ok(b) if (20.0..=400.0).contains(&b) => {
                 engine.update(|s| s.bpm = b)?;
@@ -317,7 +310,6 @@ fn handle(engine: &mut Engine, line: &str) -> Result<bool> {
                 None => println!("Timer: off"),
             }
             println!("Keep controllers: {}", onoff(s.keep_controllers));
-            println!("Pre-roll: {} ms", s.preroll_ms);
             println!("Tempo in files: {} bpm", s.bpm);
         }
 
@@ -355,7 +347,6 @@ pause on|off|<sec>     split recording on silence; a number sets the threshold
 auto on|off            start recording on the first note
 timer <time>|off       stop after this time (90, 2m, 1:30)
 controllers on|off     write last controller values at the start of each new file
-preroll <ms>           controller capture window before the first note
 bpm <n>                tempo stored in files
 dir <path>, name <base>  folder and file name base
 settings               show all settings

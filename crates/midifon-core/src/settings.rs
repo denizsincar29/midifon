@@ -26,8 +26,6 @@ pub struct Settings {
     pub timer_secs: Option<u64>,
     /// Писать последние значения контроллеров в начало каждого нового файла.
     pub keep_controllers: bool,
-    /// Сколько мс контроллеров до первой ноты захватывать при автозаписи.
-    pub preroll_ms: u64,
     /// Темп в заголовке файла (на запись не влияет, только на шкалу тиков).
     pub bpm: f64,
 }
@@ -47,7 +45,6 @@ impl Default for Settings {
             pause_secs: 5.0,
             timer_secs: None,
             keep_controllers: true,
-            preroll_ms: 500,
             bpm: 120.0,
         }
     }
